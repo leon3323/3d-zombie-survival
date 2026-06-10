@@ -1,0 +1,624 @@
+import * as THREE from 'three';
+
+// -------------------------------------------------------------------
+// UTILITIES & SETUP
+// -------------------------------------------------------------------
+const degreesToRadians = (degrees: number) => degrees * (Math.PI / 180);
+const isEvenOrOdd = (i: number) => (i % 2 === 0 ? 1 : -1);
+const random = (min: number, max: number) => Math.floor(Math.random() * (max - min) + min);
+
+const sizes = { width: window.innerWidth, height: window.innerHeight };
+
+const canvas = document.querySelector('[data-canvas]') as HTMLCanvasElement;
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x151515);
+
+const renderer = new THREE.WebGLRenderer({ canvas: canvas || undefined, antialias: true });
+renderer.setSize(sizes.width, sizes.height);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+
+if (!canvas) {
+  document.body.appendChild(renderer.domElement);
+}
+
+const camera = new THREE.PerspectiveCamera(75, sizes.width / sizes.height, 0.1, 1000);
+camera.position.set(0, 12, 9); 
+
+const lightAmbient = new THREE.AmbientLight(0x9eaeff, 0.4);
+scene.add(lightAmbient);
+const lightDirectional = new THREE.DirectionalLight(0xffffff, 1);
+lightDirectional.position.set(5, 12, 5);
+scene.add(lightDirectional);
+
+// THE GROUND
+const groundGeo = new THREE.PlaneGeometry(70, 70);
+const groundMat = new THREE.MeshStandardMaterial({ color: 0x2A442A, roughness: 0.9 });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+scene.add(ground);
+
+// --- 🏠 THE BASE (Center Ring) ---
+const baseRadius = 5;
+let baseHealth = 100; 
+let isBaseDestroyed = false;
+
+const baseGeo = new THREE.CylinderGeometry(baseRadius, baseRadius, 0.1, 32);
+const baseMat = new THREE.MeshStandardMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.25 });
+const safeBase = new THREE.Mesh(baseGeo, baseMat);
+safeBase.position.set(0, 0.05, 0); 
+scene.add(safeBase);
+
+const ringGeo = new THREE.RingGeometry(baseRadius - 0.1, baseRadius, 32);
+const ringMat = new THREE.MeshBasicMaterial({ color: 0x00ffaa, side: THREE.DoubleSide });
+const baseRing = new THREE.Mesh(ringGeo, ringMat);
+baseRing.rotation.x = Math.PI / 2;
+baseRing.position.y = 0.08;
+scene.add(baseRing);
+
+// --- 🧱 OBSTACLES ---
+const obstacles: THREE.Mesh[] = [];
+const obstacleGeo = new THREE.BoxGeometry(3, 4, 3);
+const obstacleMat = new THREE.MeshStandardMaterial({ color: 0x555555 });
+const wallPositions = [{ x: -12, z: -12 }, { x: 12, z: -14 }, { x: -14, z: 14 }, { x: 12, z: 12 }];
+
+wallPositions.forEach(pos => {
+  const wall = new THREE.Mesh(obstacleGeo, obstacleMat);
+  wall.position.set(pos.x, 2, pos.z);
+  scene.add(wall);
+  obstacles.push(wall);
+});
+
+// --- 🪵 WOOD LOGS & TREES ENGINE ---
+const woodLogs: THREE.Mesh[] = [];
+const woodGeo = new THREE.CylinderGeometry(0.15, 0.15, 0.8, 8);
+const woodMat = new THREE.MeshStandardMaterial({ color: 0x8B4513, roughness: 0.9 });
+
+function spawnWoodLogAt(x: number, z: number) {
+  const log = new THREE.Mesh(woodGeo, woodMat);
+  log.rotation.z = Math.PI / 2; 
+  log.position.set(x + Math.random() * 1.5 - 0.75, 0.15, z + Math.random() * 1.5 - 0.75);
+  scene.add(log);
+  woodLogs.push(log);
+}
+
+const trees: { group: THREE.Group; trunk: THREE.Mesh; health: number }[] = [];
+
+function spawnTree() {
+  const treeGroup = new THREE.Group();
+  const trunkGeo = new THREE.CylinderGeometry(0.3, 0.4, 3, 8);
+  const trunkMat = new THREE.MeshStandardMaterial({ color: 0x5a3d28, roughness: 0.9 });
+  const trunk = new THREE.Mesh(trunkGeo, trunkMat);
+  trunk.position.y = 1.5;
+  treeGroup.add(trunk);
+  
+  const leavesGeo = new THREE.BoxGeometry(2, 2, 2);
+  const leavesMat = new THREE.MeshStandardMaterial({ color: 0x1A5F1A, roughness: 0.8 });
+  const leaves = new THREE.Mesh(leavesGeo, leavesMat);
+  leaves.position.y = 3.5;
+  treeGroup.add(leaves);
+  
+  treeGroup.position.set(random(-28, 28), 0, random(-28, 28));
+  if (treeGroup.position.length() < baseRadius + 4) treeGroup.position.setLength(baseRadius + 6);
+  
+  scene.add(treeGroup);
+  trees.push({ group: treeGroup, trunk: trunk, health: 5 });
+}
+
+for (let i = 0; i < 6; i++) spawnTree();
+
+// --- 🔫 WEAPON DROPS ENGINE ---
+const droppedWeapons: { mesh: THREE.Mesh; type: string }[] = [];
+const itemBoxGeo = new THREE.BoxGeometry(0.6, 0.3, 0.6);
+
+function spawnWeaponDrop(x: number, z: number, type: string) {
+  const color = type === 'shotgun' ? 0xff6600 : 0xffff00;
+  const itemMat = new THREE.MeshStandardMaterial({ color: color, emissive: color, emissiveIntensity: 0.5 });
+  const dropMesh = new THREE.Mesh(itemBoxGeo, itemMat);
+  dropMesh.position.set(x, 0.3, z);
+  
+  scene.add(dropMesh);
+  droppedWeapons.push({ mesh: dropMesh, type: type });
+}
+
+// -------------------------------------------------------------------
+// CHARACTER BUILDER ENGINE
+// -------------------------------------------------------------------
+class GameCharacter {
+  group: THREE.Group;
+  head!: THREE.Group;
+  body!: THREE.Group;
+  arms: THREE.Group[] = [];
+  legs: THREE.Group = new THREE.Group();
+  bodyMaterial!: THREE.MeshStandardMaterial;
+  headMaterial!: THREE.MeshStandardMaterial;
+  type: string;
+
+  constructor(type: string) {
+    this.group = new THREE.Group();
+    this.type = type;
+    this.initColors();
+    this.initGeometry();
+    scene.add(this.group);
+  }
+
+  initColors() {
+    if (this.type === 'player') {
+      this.headMaterial = new THREE.MeshStandardMaterial({ color: 0xffdbac, roughness: 0.4 });
+      this.bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x00d2ff, roughness: 0.4 });
+    } else if (this.type === 'runner') {
+      this.bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x8800aa, roughness: 0.5 }); 
+      this.headMaterial = new THREE.MeshStandardMaterial({ color: 0x44aa77, roughness: 0.6 });
+    } else if (this.type === 'tank') {
+      this.bodyMaterial = new THREE.MeshStandardMaterial({ color: 0x112244, roughness: 0.4 }); 
+      this.headMaterial = new THREE.MeshStandardMaterial({ color: 0x226633, roughness: 0.5 });
+    } else {
+      this.bodyMaterial = new THREE.MeshStandardMaterial({ color: 0xaa0000, roughness: 0.5 }); 
+      this.headMaterial = new THREE.MeshStandardMaterial({ color: 0x55aa55, roughness: 0.6 });
+    }
+  }
+
+  initGeometry() {
+    let bW = 0.8, bH = 1.2, bD = 0.6, hS = 1.0;
+    if (this.type === 'tank') { bW = 1.6; bH = 2.0; bD = 1.2; hS = 1.5; }
+    if (this.type === 'runner') { bW = 0.6; bH = 1.0; bD = 0.5; hS = 0.8; }
+
+    this.body = new THREE.Group();
+    const bodyMain = new THREE.Mesh(new THREE.BoxGeometry(bW, bH, bD), this.bodyMaterial);
+    this.body.add(bodyMain);
+    this.group.add(this.body);
+    this.body.position.y = bH / 2 + 0.2;
+
+    this.head = new THREE.Group();
+    const headMain = new THREE.Mesh(new THREE.BoxGeometry(hS, hS, hS), this.headMaterial);
+    this.head.add(headMain);
+    this.group.add(this.head);
+    this.head.position.y = bH + (hS / 2) + 0.2;
+
+    const eyeGeo = new THREE.SphereGeometry(0.08 * hS, 8, 8);
+    const eyeMat = new THREE.MeshStandardMaterial({ color: this.type === 'player' ? 0x111111 : 0xff0000 });
+    for (let i = 0; i < 2; i++) {
+      const eye = new THREE.Mesh(eyeGeo, eyeMat);
+      eye.position.set(0.25 * hS * isEvenOrOdd(i), 0, hS / 2 + 0.02);
+      this.head.add(eye);
+    }
+
+    const armGeo = new THREE.BoxGeometry(0.2 * hS, 0.7 * bH, 0.2 * hS);
+    for (let i = 0; i < 2; i++) {
+      const armGroup = new THREE.Group();
+      const arm = new THREE.Mesh(armGeo, this.headMaterial);
+      arm.position.y = -(0.7 * bH) / 2;
+      armGroup.add(arm);
+      this.arms.push(armGroup);
+      this.group.add(armGroup);
+      armGroup.position.set(isEvenOrOdd(i) * (bW / 2 + 0.15), bH + 0.1, 0);
+      if (this.type !== 'player') armGroup.rotation.x = degreesToRadians(-90);
+    }
+
+    const legGeo = new THREE.BoxGeometry(0.2 * hS, 0.4 * bH, 0.2 * hS);
+    for (let i = 0; i < 2; i++) {
+      const leg = new THREE.Mesh(legGeo, this.bodyMaterial);
+      leg.position.x = isEvenOrOdd(i) * (bW / 4);
+      this.legs.add(leg);
+    }
+    this.legs.position.y = 0.2;
+    this.body.add(this.legs);
+  }
+}
+
+// -------------------------------------------------------------------
+// GAME SYSTEM CORE VARIABLES
+// -------------------------------------------------------------------
+let playerCharacter = new GameCharacter('player');
+let player = playerCharacter.group;
+
+let zombies: { character: GameCharacter; health: number; speed: number; maxHp: number }[] = [];
+let score = 0;
+let playerHealth = 3;
+let heldWoodCount = 0; 
+let isGameOver = false;
+let isPaused = false; // ⏸️ Core tracking variable for state halts
+let lastDamageTime = 0; 
+let lastHealTime = 0;
+
+let currentWeapon = 'pistol'; 
+let lastShotTime = 0;
+
+const unlockedWeapons = {
+  pistol: true,
+  shotgun: false,
+  machinegun: false
+};
+
+const weaponStats = {
+  pistol: { delay: 400, range: 18, spreads: [0] },
+  shotgun: { delay: 800, range: 12, spreads: [-0.25, 0, 0.25] },
+  machinegun: { delay: 150, range: 15, spreads: [0] }
+};
+
+// --- TOP HUD PANEL ---
+const topHud = document.createElement('div');
+topHud.style.position = 'absolute'; topHud.style.top = '15px'; topHud.style.left = '15px';
+topHud.style.color = '#ffffff'; topHud.style.fontFamily = 'monospace'; topHud.style.fontWeight = 'bold';
+topHud.style.textShadow = '1px 1px 2px #000000'; topHud.style.display = 'flex'; topHud.style.flexDirection = 'column'; topHud.style.gap = '3px';
+document.body.appendChild(topHud);
+
+const scoreUI = document.createElement('div'); scoreUI.style.fontSize = '16px';
+const healthUI = document.createElement('div'); healthUI.style.fontSize = '15px'; healthUI.style.color = '#ff4444';
+const baseUI = document.createElement('div'); baseUI.style.fontSize = '13px'; baseUI.style.color = '#00ffaa';
+
+topHud.appendChild(scoreUI); topHud.appendChild(healthUI); topHud.appendChild(baseUI);
+
+// --- 🪵 BOTTOM HUD PANEL ---
+const bottomHud = document.createElement('div');
+bottomHud.style.position = 'absolute'; bottomHud.style.bottom = '15px'; bottomHud.style.left = '15px';
+bottomHud.style.color = '#ffffff'; bottomHud.style.fontFamily = 'monospace'; bottomHud.style.fontWeight = 'bold';
+bottomHud.style.textShadow = '1px 1px 2px #000000'; bottomHud.style.display = 'flex'; bottomHud.style.flexDirection = 'column'; bottomHud.style.gap = '4px';
+document.body.appendChild(bottomHud);
+
+const weaponUI = document.createElement('div'); weaponUI.style.fontSize = '12px'; weaponUI.style.color = '#ffffff';
+const inventoryUI = document.createElement('div'); inventoryUI.style.fontSize = '12px'; inventoryUI.style.color = '#ffffff';
+
+bottomHud.appendChild(weaponUI); bottomHud.appendChild(inventoryUI);
+
+// --- ⏸️ INTERACTIVE PAUSE / PLAY ELEMENT BUTTON ---
+const pauseBtn = document.createElement('button');
+pauseBtn.innerText = '⏸️ PAUSE';
+pauseBtn.style.position = 'absolute';
+pauseBtn.style.top = '15px';
+pauseBtn.style.right = '15px'; // Place directly top-right corner
+pauseBtn.style.padding = '8px 16px';
+pauseBtn.style.fontFamily = 'monospace';
+pauseBtn.style.fontSize = '12px';
+pauseBtn.style.fontWeight = 'bold';
+pauseBtn.style.color = '#ffffff';
+pauseBtn.style.backgroundColor = '#333333';
+pauseBtn.style.border = '2px solid #555555';
+pauseBtn.style.borderRadius = '4px';
+pauseBtn.style.cursor = 'pointer';
+pauseBtn.style.boxShadow = '1px 1px 3px rgba(0,0,0,0.5)';
+pauseBtn.addEventListener('click', togglePauseState);
+document.body.appendChild(pauseBtn);
+
+function togglePauseState() {
+  if (isGameOver) return; // Prevent pause manipulations after defeat state
+  isPaused = !isPaused;
+  if (isPaused) {
+    pauseBtn.innerText = '▶️ PLAY';
+    pauseBtn.style.backgroundColor = '#225522';
+    pauseBtn.style.borderColor = '#33aa33';
+  } else {
+    pauseBtn.innerText = '⏸️ PAUSE';
+    pauseBtn.style.backgroundColor = '#333333';
+    pauseBtn.style.borderColor = '#555555';
+  }
+}
+
+function updateHUD() {
+  scoreUI.innerText = `Zombies Eliminated: ${score}`;
+  healthUI.innerText = '❤️ '.repeat(Math.max(0, playerHealth));
+  inventoryUI.innerText = `🪵 Wood Logs Carried: ${heldWoodCount}`;
+  
+  let weaponText = `🔫 Active Weapon: ${currentWeapon.toUpperCase()}`;
+  let inventoryOptions = ['1 (Pistol)'];
+  if (unlockedWeapons.shotgun) inventoryOptions.push('2 (Shotgun)');
+  if (unlockedWeapons.machinegun) inventoryOptions.push('3 (Machine Gun)');
+  weaponUI.innerText = `${weaponText} \n🎮 Available Arsenal Slots: [ ${inventoryOptions.join(' | ')} ]`;
+  
+  if (isBaseDestroyed) {
+    baseUI.innerText = `⚠️ BASE DESTROYED ⚠️`; baseUI.style.color = '#ff4444';
+  } else {
+    baseUI.innerText = `Base Shield Integrity: ${Math.ceil(baseHealth)}% ${heldWoodCount > 0 && baseHealth < 100 ? '(Press E to Repair!)' : ''}`;
+    baseUI.style.color = baseHealth < 40 ? '#ffaa00' : '#00ffaa';
+  }
+}
+
+// --- OVERLAYS & GAME OVER ---
+const damageFlash = document.createElement('div');
+damageFlash.style.position = 'absolute'; damageFlash.style.width = '100%'; damageFlash.style.height = '100%';
+damageFlash.style.backgroundColor = 'rgba(255, 0, 0, 0)'; damageFlash.style.pointerEvents = 'none';
+damageFlash.style.transition = 'background-color 0.1s ease-out';
+document.body.appendChild(damageFlash);
+
+const gameOverScreen = document.createElement('div');
+gameOverScreen.style.position = 'absolute'; gameOverScreen.style.width = '100%'; gameOverScreen.style.height = '100%';
+gameOverScreen.style.backgroundColor = 'rgba(0, 0, 0, 0.9)'; gameOverScreen.style.display = 'none';
+gameOverScreen.style.flexDirection = 'column'; gameOverScreen.style.justifyContent = 'center'; gameOverScreen.style.alignItems = 'center';
+gameOverScreen.style.fontFamily = 'sans-serif'; gameOverScreen.style.color = '#ff4444';
+
+const overTitle = document.createElement('h1'); overTitle.innerText = 'GAME OVER'; overTitle.style.fontSize = '60px';
+const finalScore = document.createElement('p'); finalScore.style.color = '#ffffff'; finalScore.style.fontSize = '24px';
+const retryBtn = document.createElement('button'); retryBtn.innerText = 'TRY AGAIN'; retryBtn.style.padding = '12px 30px';
+retryBtn.style.backgroundColor = '#ff4444'; retryBtn.style.color = '#fff'; retryBtn.style.border = 'none'; retryBtn.style.borderRadius = '5px'; retryBtn.style.cursor = 'pointer';
+retryBtn.addEventListener('click', restartGame);
+
+gameOverScreen.appendChild(overTitle); gameOverScreen.appendChild(finalScore); gameOverScreen.appendChild(retryBtn);
+document.body.appendChild(gameOverScreen);
+
+function restartGame() {
+  zombies.forEach(z => scene.remove(z.character.group)); zombies = [];
+  woodLogs.forEach(log => scene.remove(log)); woodLogs.length = 0;
+  trees.forEach(t => scene.remove(t.group)); trees.length = 0;
+  droppedWeapons.forEach(w => scene.remove(w.mesh)); droppedWeapons.length = 0;
+
+  score = 0; playerHealth = 3; baseHealth = 100; heldWoodCount = 0; isBaseDestroyed = false; currentWeapon = 'pistol';
+  unlockedWeapons.shotgun = false; unlockedWeapons.machinegun = false;
+  player.position.set(0, 0, 0); isGameOver = false; isPaused = false;
+  
+  pauseBtn.innerText = '⏸️ PAUSE';
+  pauseBtn.style.backgroundColor = '#333333';
+  pauseBtn.style.borderColor = '#555555';
+
+  scene.add(safeBase); scene.add(baseRing);
+  for (let i = 0; i < 6; i++) spawnTree();
+  for (let i = 0; i < 3; i++) spawnWoodLogAt(random(-15, 15), random(-15, 15));
+
+  updateHUD();
+  gameOverScreen.style.display = 'none';
+  spawnZombieHorde(); spawnZombieHorde();
+}
+
+// --- HORDE GENERATOR REGISTRY ---
+function spawnZombieHorde() {
+  if (isGameOver || isPaused) return; // Prevent spawns during freezes
+  
+  const roll = Math.random();
+  let type = 'normal'; let hp = 3; let speed = 0.025;
+  
+  if (roll < 0.25) { type = 'runner'; hp = 1; speed = 0.055; } 
+  else if (roll > 0.85) { type = 'tank'; hp = 12; speed = 0.012; } 
+  
+  const zombie = new GameCharacter(type);
+  const zMesh = zombie.group;
+  const angle = Math.random() * Math.PI * 2;
+  const distance = 26 + Math.random() * 6;
+  
+  zMesh.position.set(player.position.x + Math.cos(angle) * distance, 0, player.position.z + Math.sin(angle) * distance);
+  zombies.push({ character: zombie, health: hp, maxHp: hp, speed: speed });
+}
+
+spawnZombieHorde(); spawnZombieHorde();
+setInterval(spawnZombieHorde, 4500);
+
+// --- OPERATION INTERFACES ---
+const raycaster = new THREE.Raycaster();
+const mouse = new THREE.Vector2();
+let targetAimPoint = new THREE.Vector3();
+let lastDirection = new THREE.Vector3(0, 0, -1);
+
+window.addEventListener('mousemove', (e) => {
+  mouse.x = (e.clientX / window.innerWidth) * 2 - 1;
+  mouse.y = -(e.clientY / window.innerHeight) * 2 + 1;
+});
+
+const keys = { w: false, a: false, s: false, d: false };
+window.addEventListener('keydown', (e) => {
+  if (isPaused || isGameOver) return;
+  const k = e.key.toLowerCase();
+  if (k in keys) keys[k] = true;
+  
+  if (k === '1') { currentWeapon = 'pistol'; updateHUD(); }
+  if (k === '2' && unlockedWeapons.shotgun) { currentWeapon = 'shotgun'; updateHUD(); }
+  if (k === '3' && unlockedWeapons.machinegun) { currentWeapon = 'machinegun'; updateHUD(); }
+
+  if (k === 'e' && player.position.length() < baseRadius && heldWoodCount > 0 && baseHealth < 100) {
+    heldWoodCount--; baseHealth = Math.min(100, baseHealth + 20); updateHUD();
+    (safeBase.material as THREE.MeshStandardMaterial).color.setHex(0x995522);
+    setTimeout(() => { if (!isBaseDestroyed) (safeBase.material as THREE.MeshStandardMaterial).color.setHex(0x00ffaa); }, 150);
+  }
+});
+window.addEventListener('keyup', (e) => { const k = e.key.toLowerCase(); if (k in keys) keys[k] = false; });
+
+// SHOOTING ROUTINE
+window.addEventListener('click', (e) => {
+  // Prevent shooting action checks if clicking the Pause overlay button itself
+  if (e.clientX > window.innerWidth - 120 && e.clientY < 60) return;
+  if (isGameOver || isPaused) return;
+
+  const now = performance.now();
+  const stats = weaponStats[currentWeapon];
+  if (now - lastShotTime < stats.delay) return; 
+  lastShotTime = now;
+
+  const shootPos = player.position.clone(); shootPos.y = 1.0;
+  const baseDir = new THREE.Vector3().subVectors(targetAimPoint, shootPos);
+  baseDir.y = 0; baseDir.normalize();
+
+  stats.spreads.forEach(spreadAngle => {
+    const fireDirection = baseDir.clone().applyAxisAngle(new THREE.Vector3(0, 1, 0), spreadAngle);
+    
+    const mat = new THREE.LineBasicMaterial({ color: 0xffff00 });
+    const points = [shootPos, shootPos.clone().addScaledVector(fireDirection, stats.range)];
+    const geo = new THREE.BufferGeometry().setFromPoints(points);
+    const line = new THREE.Line(geo, mat);
+    scene.add(line);
+    setTimeout(() => scene.remove(line), 60);
+
+    // 🌳 CHOP TREES TEST
+    trees.forEach((tree, tIdx) => {
+      const pToTree = new THREE.Vector3().subVectors(tree.group.position, player.position);
+      if (pToTree.length() < stats.range) {
+        if (fireDirection.angleTo(pToTree.normalize()) < 0.25) {
+          tree.health--;
+          (tree.trunk.material as THREE.MeshStandardMaterial).color.setHex(0xffffff); 
+          setTimeout(() => (tree.trunk.material as THREE.MeshStandardMaterial).color.setHex(0x5a3d28), 60);
+          
+          if (tree.health <= 0) {
+            for (let k = 0; k < 3; k++) spawnWoodLogAt(tree.group.position.x, tree.group.position.z);
+            scene.remove(tree.group);
+            trees.splice(tIdx, 1);
+            spawnTree(); 
+          }
+        }
+      }
+    });
+
+    // 🧟 HIT ZOMBIES TEST
+    zombies.forEach((zombie, zIdx) => {
+      const pToZombie = new THREE.Vector3().subVectors(zombie.character.group.position, player.position);
+      if (pToZombie.length() < stats.range) {
+        if (fireDirection.angleTo(pToZombie.normalize()) < 0.22) {
+          zombie.health--;
+          
+          const mainTorso = zombie.character.body.children[0] as THREE.Mesh;
+          const oldColor = mainTorso.material.color.getHex();
+          (mainTorso.material as THREE.MeshStandardMaterial).color.setHex(0xffffff);
+          setTimeout(() => (mainTorso.material as THREE.MeshStandardMaterial).color.setHex(oldColor), 60);
+
+          if (zombie.health <= 0) {
+            const zX = zombie.character.group.position.x;
+            const zZ = zombie.character.group.position.z;
+            
+            if (zombie.character.type === 'runner') {
+              spawnWeaponDrop(zX, zZ, 'shotgun');
+            } else if (zombie.character.type === 'tank') {
+              spawnWeaponDrop(zX, zZ, 'machinegun');
+            }
+
+            scene.remove(zombie.character.group);
+            zombies.splice(zIdx, 1);
+            score++; updateHUD();
+          }
+        }
+      }
+    });
+  });
+});
+
+const playerSpeed = 0.12;
+let animationTimer = 0;
+
+// -------------------------------------------------------------------
+// RUNTIME TICK LOOP ENGINE
+// -------------------------------------------------------------------
+function animate() {
+  requestAnimationFrame(animate);
+  
+  // 🛑 PAUSE BLOCK ENFORCEMENT
+  if (isPaused || isGameOver) {
+    renderer.render(scene, camera); // Render the frozen frame scene state statically
+    return; 
+  }
+
+  animationTimer += 0.2;
+  const currentTime = performance.now();
+
+  // Mouse Raycast Aiming
+  raycaster.setFromCamera(mouse, camera);
+  const intersects = raycaster.intersectObject(ground);
+  if (intersects.length > 0) {
+    targetAimPoint.copy(intersects[0].point);
+    player.rotation.y = Math.atan2(targetAimPoint.x - player.position.x, targetAimPoint.z - player.position.z);
+    lastDirection.set(targetAimPoint.x - player.position.x, 0, targetAimPoint.z - player.position.z).normalize();
+  }
+
+  // WASD Movement Operations
+  const moveDir = new THREE.Vector3(0, 0, 0);
+  if (keys.w) moveDir.z -= 1; if (keys.s) moveDir.z += 1;
+  if (keys.a) moveDir.x -= 1; if (keys.d) moveDir.x += 1;
+
+  if (moveDir.lengthSq() > 0) {
+    moveDir.normalize();
+    const prevX = player.position.x; const prevZ = player.position.z;
+    player.position.addScaledVector(moveDir, playerSpeed);
+
+    playerCharacter.legs.children.forEach((leg, i) => leg.rotation.x = Math.sin(animationTimer) * 0.6 * isEvenOrOdd(i));
+    playerCharacter.arms.forEach((arm, i) => arm.rotation.x = Math.cos(animationTimer) * 0.4 * isEvenOrOdd(i));
+
+    obstacles.forEach(wall => {
+      if (Math.abs(player.position.x - wall.position.x) < 2.2 && Math.abs(player.position.z - wall.position.z) < 2.2) {
+        player.position.x = prevX; player.position.z = prevZ;
+      }
+    });
+  } else {
+    playerCharacter.legs.children.forEach(leg => leg.rotation.x = 0);
+    playerCharacter.arms.forEach(arm => arm.rotation.x = 0);
+  }
+
+  // Log Resource Pickup Processing
+  woodLogs.forEach((log, index) => {
+    if (player.position.distanceTo(log.position) < 1.2) {
+      scene.remove(log); woodLogs.splice(index, 1);
+      heldWoodCount++; updateHUD();
+    }
+  });
+
+  // WEAPON CRATE PICKUP DETECTION
+  droppedWeapons.forEach((drop, index) => {
+    drop.mesh.rotation.y += 0.04;
+    drop.mesh.rotation.x += 0.02;
+
+    if (player.position.distanceTo(drop.mesh.position) < 1.4) {
+      if (drop.type === 'shotgun') unlockedWeapons.shotgun = true;
+      if (drop.type === 'machinegun') unlockedWeapons.machinegun = true;
+      currentWeapon = drop.type;
+      
+      scene.remove(drop.mesh);
+      droppedWeapons.splice(index, 1);
+      updateHUD();
+    }
+  });
+
+  // Base Safe Zone Health Regen
+  if (player.position.length() < baseRadius && !isBaseDestroyed && playerHealth < 3 && currentTime - lastHealTime > 3000) {
+    playerHealth++; lastHealTime = currentTime; updateHUD();
+  }
+
+  // Zombie Movement Intelligence
+  zombies.forEach(zombie => {
+    const zGroup = zombie.character.group;
+    const zombieDir = new THREE.Vector3().subVectors(player.position, zGroup.position);
+    zombieDir.y = 0; 
+    const distanceToPlayer = zombieDir.length();
+    const zombieDistanceFromCenter = zGroup.position.length();
+    zombieDir.normalize();
+    
+    if (!isBaseDestroyed && zombieDistanceFromCenter <= baseRadius + 0.1 && player.position.length() < baseRadius) {
+      baseHealth -= zombie.type === 'tank' ? 0.25 : 0.08; 
+      updateHUD();
+      zGroup.position.setLength(baseRadius + 0.2);
+      
+      const mainTorso = zombie.character.body.children[0] as THREE.Mesh;
+      mainTorso.material.color.setHex(0xffaa00); 
+
+      if (baseHealth <= 0) {
+        isBaseDestroyed = true; scene.remove(safeBase); scene.remove(baseRing); updateHUD();
+      }
+    } else {
+      zGroup.position.addScaledVector(zombieDir, zombie.speed);
+      const mainTorso = zombie.character.body.children[0] as THREE.Mesh;
+      if (mainTorso) {
+        if (zombie.type === 'runner') mainTorso.material.color.setHex(0x8800aa);
+        else if (zombie.type === 'tank') mainTorso.material.color.setHex(0x112244);
+        else mainTorso.material.color.setHex(0xaa0000);
+      }
+    }
+
+    zGroup.rotation.y = Math.atan2(zombieDir.x, zombieDir.z);
+    zombie.character.legs.children.forEach((leg, i) => leg.rotation.x = Math.sin(animationTimer * 0.7) * 0.3 * isEvenOrOdd(i));
+
+    // Player Combat Collision Check
+    if (distanceToPlayer < (zombie.type === 'tank' ? 1.6 : 1.1)) {
+      if (currentTime - lastDamageTime > 1000) {
+        playerHealth--; lastDamageTime = currentTime; updateHUD();
+        damageFlash.style.backgroundColor = 'rgba(255, 0, 0, 0.4)';
+        setTimeout(() => { damageFlash.style.backgroundColor = 'rgba(255, 0, 0, 0)'; }, 100);
+        if (playerHealth <= 0) { isGameOver = true; finalScore.innerText = `You defended your base and eliminated ${score} zombies!`; gameOverScreen.style.display = 'flex'; }
+      }
+    }
+  });
+
+  camera.position.x = player.position.x;
+  camera.position.z = player.position.z + 7;
+  camera.lookAt(player.position);
+
+  renderer.render(scene, camera);
+}
+
+animate();
+updateHUD();
+
+window.addEventListener('resize', () => {
+  sizes.width = window.innerWidth; sizes.height = window.innerHeight;
+  camera.aspect = sizes.width / sizes.height; camera.updateProjectionMatrix();
+  renderer.setSize(sizes.width, sizes.height);
+});
